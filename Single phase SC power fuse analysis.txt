@@ -1,0 +1,461 @@
+import os
+import time
+import pandas as pd
+import sqlalchemy
+import sqlite3
+import re
+import matplotlib.pyplot as plt
+import numpy as np
+import networkx as nx
+
+from typing import List, Dict
+from sqlalchemy import create_engine, MetaData, Table, update
+from sqlalchemy.orm import sessionmaker
+
+from Models.Sincal.Database.sc1_branch_result import SC1BranchResult
+from Models.Sincal.Database.sc1_node_result import SC1NodeResult
+
+import win32com.client as win32
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+# Utility Functions
+def get_networkmodels_db(root_path: str) -> List[str]:
+    """Fills a list with all paths of database.db files in the given directory."""
+    models = []
+    filename = "database.db"
+    for dirpath, dirnames, files in os.walk(root_path):
+        if filename in files:
+            models.append(os.path.join(dirpath, filename))
+    return models
+
+def get_networkmodels_sin(root_path: str) -> List[str]:
+    """Fills a list with all paths of .sin files in the given directory."""
+    models = []
+    for dirpath, dirnames, files in os.walk(root_path):
+        for file in files:
+            if file.endswith(".sin"):
+                models.append(os.path.join(dirpath, file))
+    return models
+
+def match_network_models(db_models: List[str], sin_models: List[str]) -> List[Dict[str, str]]:
+    """Matches database models with sin files based on common identifiers in filenames."""
+    matched_models = []
+    for db_model in db_models:
+        db_identifier = os.path.basename(os.path.dirname(db_model))
+        for sin_model in sin_models:
+            sin_identifier = os.path.basename(sin_model).replace(".sin", "")
+            if sin_identifier in db_identifier:
+                matched_models.append({"db": db_model, "sin": sin_model})
+                break
+    return matched_models
+
+def create_database_session(db_path: str):
+    """Creates a database session for the given database path."""
+    if not os.path.isfile(db_path):
+        logging.error(f"Database file not found at {db_path}")
+        raise FileNotFoundError(f"Database file not found at {db_path}")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    metadata = MetaData()
+    metadata.reflect(bind=engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    return session, engine, metadata
+
+def named_entity_recognition(node_name: str):
+    """Identifies named entities based on the name pattern."""
+    if re.match(r'^STST410635', node_name):
+        return 'primary_node'
+    elif re.match(r'^KVS', node_name):
+        return 'kvs_node'
+    elif re.match(r'^lv_switch_node', node_name):
+        return 'switch_node'
+    else:
+        return 'other_node'
+
+
+# Main Function
+def main_power_fuse_analysis():
+    ROOT_PATH = r"C:\Temp\Tools\Sincal\ANNA\AusgespielteNetze"
+    networkmodels_db = get_networkmodels_db(ROOT_PATH)
+    networkmodels_sin = get_networkmodels_sin(ROOT_PATH)
+
+    matched_models = match_network_models(networkmodels_db, networkmodels_sin)
+
+    if len(matched_models) == 0:
+        raise ValueError("No matching network models found.")
+
+    for model in matched_models:
+        try:
+            sincal_app = win32.Dispatch("SIASincal.Application")
+        except Exception as e:
+            sincal_app = None
+            print(f"Error: CreateObject SIASincal.Application failed! {e}")
+
+        if sincal_app:
+            while not sincal_app.IsReady():
+                time.sleep(0.2)
+        else:
+            print("Sincal application could not be started. Exiting.")
+            continue
+
+        sincal_document = sincal_app.OpenDocument(model["sin"])
+        if sincal_document is None:
+            print("Error: Unable to open sincal document!")
+            continue
+
+        try:
+            session, engine, metadata = create_database_session(model["db"])
+
+            # Use Table object instead of ORM class
+            element_table = Table("Element", metadata, autoload_with=engine)
+            line_table = Table("Line", metadata, autoload_with=engine)
+            terminal_table = Table("Terminal", metadata, autoload_with=engine)
+            node_table = Table("Node", metadata, autoload_with=engine)
+
+            # Fetch and print specific attributes from Line table (limit to 50)
+            try:
+                line_query = session.query(line_table.c.Element_ID, line_table.c.Ith).limit(50).all()
+                print("\nLine Table Data (First 50 Rows):")
+                for row in line_query:
+                    print(f"Element_ID: {row.Element_ID}, Ith: {row.Ith}")
+            except Exception as e:
+                print(f"Error querying Line table: {e}")
+
+            # Fetch and print specific attributes from Element table (limit to 50)
+            try:
+                element_query = session.query(element_table.c.Element_ID, element_table.c.Name, element_table.c.Type).limit(50).all()
+                print("\nElement Table Data (First 50 Rows):")
+                for row in element_query:
+                    print(f"Element_ID: {row.Element_ID}, Name: {row.Name}, Type: {row.Type}")
+            except Exception as e:
+                print(f"Error querying Element table: {e}")
+
+            # Fetch and print specific attributes from Terminal table (limit to 50)
+            try:
+                terminal_query = session.query(terminal_table.c.Terminal_ID, terminal_table.c.Element_ID, terminal_table.c.Node_ID).limit(50).all()
+                print("\nTerminal Table Data (First 50 Rows):")
+                for row in terminal_query:
+                    print(f"Terminal_ID: {row.Terminal_ID}, Element_ID: {row.Element_ID}, Node_ID: {row.Node_ID}")
+            except Exception as e:
+                print(f"Error querying Terminal table: {e}")
+
+            # Query 1(sample): Extracting Ith values for elements with Type 'Line' and non-numeric Name
+            try:
+                non_numeric_name_filter = element_table.c.Name.op('GLOB')('*[a-zA-Z]*')
+                line_element_ids = session.query(element_table.c.Element_ID).filter(
+                    element_table.c.Type == "Line",
+                    non_numeric_name_filter
+                ).all()
+                line_element_ids = [row.Element_ID for row in line_element_ids]
+
+                ith_values_sample = session.query(line_table.c.Element_ID, line_table.c.Ith).filter(
+                    line_table.c.Element_ID.in_(line_element_ids)
+                ).all()
+
+                print("\nQuery 1(sample): Ith Values for 'Line' Elements with Non-Numeric Name:")
+                for row in ith_values_sample:
+                    print(f"Element_ID: {row.Element_ID}, Ith: {row.Ith}")
+            except Exception as e:
+                print(f"Error in Query 1(sample): {e}")
+
+            # Query 2(sample): Extracting ithmax for elements with Type 'Line' and non-numeric Name, with corresponding Element_ID
+            try:
+                terminal_ids_sample = session.query(terminal_table.c.Terminal_ID, terminal_table.c.Element_ID).filter(
+                    terminal_table.c.Element_ID.in_(line_element_ids)
+                ).all()
+
+                # Create a dictionary mapping Terminal_ID to Element_ID
+                terminal_to_element_map = {row.Terminal_ID: row.Element_ID for row in terminal_ids_sample}
+
+                ithmax_values_sample = session.query(SC1BranchResult.terminal1_id, SC1BranchResult.ithmax).filter(
+                    SC1BranchResult.terminal1_id.in_(terminal_to_element_map.keys())
+                ).filter(SC1BranchResult.ithmax != 0).all()
+
+                print("\nQuery 2(sample): ithmax Values for 'Line' Elements with Non-Numeric Name:")
+                for row in ithmax_values_sample:
+                    element_id = terminal_to_element_map.get(row.terminal1_id)
+                    print(f"Element_ID: {element_id}, ithmax: {row.ithmax}")
+            except Exception as e:
+                print(f"Error in Query 2(sample): {e}")
+
+            # Query 5: Calculate ratio ithmax / Ith for the same Element_ID, excluding zero and infinity
+            ratios = []
+            try:
+                ith_ithmax_data = session.query(
+                    line_table.c.Element_ID,
+                    line_table.c.Ith,
+                    SC1BranchResult.ithmax
+                ).join(
+                    SC1BranchResult, line_table.c.Element_ID == SC1BranchResult.terminal1_id
+                ).filter(
+                    line_table.c.Ith != 0,
+                    line_table.c.Ith <= 3,  # Exclude Ith values greater than 3
+                    SC1BranchResult.ithmax != 0
+                ).all()
+
+                print("\nQuery 5: Ratio of ithmax / Ith for the Same Element_ID (Excluding Zero and Infinity):")
+                for row in ith_ithmax_data:
+                    if row.Ith != 0:  # Avoid division by zero
+                        ratio = row.ithmax / row.Ith
+                        if ratio != float('inf'):  # Exclude infinity values
+                            ratios.append((row.Element_ID, ratio))
+                            print(f"Element_ID: {row.Element_ID}, ithmax: {row.ithmax}, Ith: {row.Ith}, Ratio: {ratio}")
+            except Exception as e:
+                print(f"Error in Query 5: {e}")
+
+            # Plot the ratio data with enhancements
+            if ratios:
+                element_ids, ratio_values = zip(*ratios)
+                norm = plt.Normalize(min(ratio_values), max(ratio_values))
+                cmap = plt.cm.viridis
+
+                plt.figure(figsize=(12, 8))
+                scatter = plt.scatter(element_ids, ratio_values, c=ratio_values, cmap=cmap, norm=norm, s=100, edgecolor='k')
+                plt.colorbar(scatter, label='Ratio of ithmax / Ith')
+                plt.title('Scatter Plot of ithmax / Ith Ratio')
+                plt.xlabel('Element ID')
+                plt.ylabel('Ratio (ithmax / Ith)')
+                plt.grid(True, linestyle='--', alpha=0.6)
+                plt.show()
+
+            # Query 4: Extracting Node Table Data (Node ID, Name, lat, lon) and plotting network
+            try:
+                node_data_query = session.query(
+                    node_table.c.Node_ID,
+                    node_table.c.Name,
+                    node_table.c.lat,
+                    node_table.c.lon
+                ).filter(
+                    node_table.c.lat != 0,
+                    node_table.c.lon != 0
+                ).all()
+
+                # Use the updated plotting function
+                plot_network_graph(session, node_data_query)
+
+            except Exception as e:
+                print(f"Error in Query 4: {e}")
+
+            # Update generator flags
+            update_gen = update(element_table).where(element_table.c.Type == "SynchronousMachine").values(Flag_State=0)
+            session.execute(update_gen)
+            session.commit()
+            print("All generators set out of service")
+
+            sincal_document.Reload()  # Ensures the document is ready after setting the generator flags
+
+            # Start the SC1 calculation
+            sincal_document.StartCalculation("SC1")
+            sincal_document.Reload()  # Reload to ensure results are updated
+
+            # Fetch results after the calculation has completed
+            sc_branches = session.query(SC1BranchResult).all()
+            sc_nodes = session.query(SC1NodeResult).all()
+
+            # Evaluate and print branch results
+            branch_results = evaluate_results(sc_branches)
+            print_branch_results(branch_results)
+
+            # Evaluate and print node results
+            node_results = evaluate_results2(sc_nodes)
+            print_node_results(node_results)
+
+        except Exception as e:
+            print(f"Error during database operations: {e}")
+        finally:
+            # Cleanup
+            sincal_document = None
+            sincal_app.CloseDocument(model["sin"])
+            session.close()
+
+def plot_network_graph(session, node_data_query):
+    print("\nQuery 4: Node Table Data (Node ID, Name, lat, lon):")
+    G = nx.Graph()
+    pos = {}
+
+    for node in node_data_query:
+        node_type = named_entity_recognition(node.Name)
+        G.add_node(node.Node_ID, name=node.Name, pos=(node.lon, node.lat), type=node_type)
+        pos[node.Node_ID] = (node.lon, node.lat)
+        print(f"Node ID: {node.Node_ID}, Name: {node.Name}, lat: {node.lat}, lon: {node.lon}")
+
+    # Custom Connections and Node Highlighting
+    stst_node = [n for n, attr in G.nodes(data=True) if attr['name'] == 'STST410635_Westre Siedlung'][0]
+    vt1_node = [n for n, attr in G.nodes(data=True) if attr['name'] == 'STST410635-VT1'][0]
+    switch_nodes = [n for n, attr in G.nodes(data=True) if attr['type'] == 'switch_node']
+    kvs_nodes = [n for n, attr in G.nodes(data=True) if attr['type'] == 'kvs_node']
+
+    # Connect primary nodes
+    G.add_edge(stst_node, vt1_node)
+
+    # Connect VT1 node (blue) directly to all switch nodes (green)
+    for switch_node in switch_nodes:
+        G.add_edge(vt1_node, switch_node)
+
+    # Connect VT1 node (blue) directly to all KVS nodes (yellow)
+    for kvs_node in kvs_nodes:
+        G.add_edge(vt1_node, kvs_node)
+
+    # Connect KVS nodes to nearest addresses from the list provided
+    address_nodes = [109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170]
+    for address_node in address_nodes:
+        closest_kvs_node = min(kvs_nodes, key=lambda n: np.linalg.norm(np.array(pos[n]) - np.array(pos[address_node])))
+        G.add_edge(address_node, closest_kvs_node)
+
+    # Plot the graph
+    plt.figure(figsize=(12, 8))
+    nx.draw(G, pos, nodelist=[stst_node], node_color='red', node_size=1000, edge_color='gray', linewidths=1, font_size=12)
+    nx.draw(G, pos, nodelist=[vt1_node], node_color='blue', node_size=1000, edge_color='gray', linewidths=1, font_size=12)
+    nx.draw(G, pos, nodelist=switch_nodes, node_color='green', node_size=700, edge_color='gray', linewidths=1, font_size=10)
+    nx.draw(G, pos, nodelist=kvs_nodes, node_color='orange', node_size=500, edge_color='gray', linewidths=1, font_size=10)
+    nx.draw(G, pos, nodelist=address_nodes, node_color='purple', node_size=300, edge_color='gray', linewidths=1, font_size=8)
+    nx.draw_networkx_edges(G, pos, edge_color='gray', width=1)
+
+    plt.title('Enhanced Network Graph with Custom Connections')
+    plt.show()
+
+
+# Data Extraction Functions
+def get_input_data(engine, metadata, session):
+    element_table = Table("Element", metadata, autoload_with=engine)
+    line_table = Table("Line", metadata, autoload_with=engine)
+    terminal_table = Table("Terminal", metadata, autoload_with=engine)
+    InputData = {}
+
+    try:
+        fuse_query = session.query(element_table.c.Element_ID).filter(element_table.c.Name == "fuse")
+        fuse_ids = [row.Element_ID for row in fuse_query.all()]
+
+        if not fuse_ids:
+            print("No fuses found in the Element table.")
+            return InputData
+
+        query = (
+            session.query(
+                element_table.c.Element_ID.label("Element_Element_ID"),
+                element_table.c.Name.label("Element_Name"),
+                line_table.c.Element_ID.label("Line_Element_ID"),
+                line_table.c.Ith.label("Line_Ith"),
+                terminal_table.c.Terminal_ID,
+                terminal_table.c.Element_ID.label("Terminal_Element_ID"),
+                terminal_table.c.Node_ID.label("Terminal_Node_ID"),
+                terminal_table.c.TerminalNo
+            )
+            .join(line_table, element_table.c.Element_ID == line_table.c.Element_ID)
+            .join(terminal_table, element_table.c.Element_ID == terminal_table.c.Element_ID)
+            .filter(line_table.c.Element_ID.in_(fuse_ids))
+        )
+        
+        result = query.all()
+        columns = ["Element_Element_ID", "Element_Name", "Line_Element_ID", "Line_Ith", "Terminal_ID", "Terminal_Element_ID", "Terminal_Node_ID", "TerminalNo"]
+        result_df = pd.DataFrame(result, columns=columns)
+
+        InputData["SubstationFuses"] = result_df[result_df["Line_Ith"] <= 0.000001]
+        InputData["HouseholdFuses"] = result_df[(result_df["Line_Ith"] > 0.000001) & (result_df["Line_Ith"] <= 0.1)]
+        InputData["CabinetFuses"] = result_df[result_df["Line_Ith"] > 0.1]
+
+    except Exception as e:
+        print(f"Error while getting input data: {e}")
+    
+    return InputData
+
+def get_node_output_data(engine, metadata, session):
+    node_table = Table("Node", metadata, autoload_with=engine)
+    sc1_node_result_table = Table("SC1NodeResult", metadata, autoload_with=engine)
+    NodeOutputData = {}
+
+    try:
+        fuse_node_query = session.query(node_table.c.Node_ID).filter(node_table.c.Name == "fuse_node")
+        fuse_node_ids = [row.Node_ID for row in fuse_node_query.all()]
+
+        if not fuse_node_ids:
+            print("No fuse_nodes found in the Node table.")
+            return NodeOutputData
+
+        sc1_query = session.query(
+            sc1_node_result_table.c.node_id,
+            sc1_node_result_table.c.ithmax,
+            sc1_node_result_table.c.ia
+        ).filter(sc1_node_result_table.c.node_id.in_(fuse_node_ids))
+        
+        result = sc1_query.all()
+        columns = ["node_id", "ithmax", "ia"]
+        result_df = pd.DataFrame(result, columns=columns)
+
+        NodeOutputData["Results"] = result_df
+
+    except Exception as e:
+        print(f"Error while getting node output data: {e}")
+    
+    return NodeOutputData
+
+def get_branch_output_data(engine, metadata, session):
+    element_table = Table("Element", metadata, autoload_with=engine)
+    terminal_table = Table("Terminal", metadata, autoload_with=engine)
+    sc1branchresult_table = Table("SC1BranchResult", metadata, autoload_with=engine)
+    BranchOutputData = {}
+
+    try:
+        fuse_query = session.query(element_table.c.Element_ID).filter(element_table.c.Name.contains("fuse"))
+        fuse_ids = [row.Element_ID for row in fuse_query.all()]
+
+        if not fuse_ids:
+            print("No fuses found in the Element table.")
+            return {}
+
+        terminal_query = session.query(terminal_table.c.Terminal_ID).filter(terminal_table.c.Element_ID.in_(fuse_ids))
+        terminal_ids = [row.Terminal_ID for row in terminal_query.all()]
+
+        if not terminal_ids:
+            print("No terminals found for the given fuses.")
+            return {}
+
+        sc1branchresult_query = session.query(
+            sc1branchresult_table.c.ithmax,
+            sc1branchresult_table.c.ia,
+            sc1branchresult_table.c.i_1a
+        ).filter(sc1branchresult_table.c.terminal1_id.in_(terminal_ids))
+        
+        result = sc1branchresult_query.all()
+        columns = ["ithmax", "ia", "i_1a"]
+        result_df = pd.DataFrame(result, columns=columns)
+
+        BranchOutputData["Results"] = result_df
+
+    except Exception as e:
+        print(f"Error while getting branch output data: {e}")
+    
+    return BranchOutputData
+
+# Evaluation Functions
+def evaluate_results(sc_branches):
+    if not sc_branches:
+        print("No branches data to evaluate.")
+        return []
+
+    return sc_branches
+
+def evaluate_results2(sc_nodes):
+    if not sc_nodes:
+        print("No node data to evaluate.")
+        return []
+
+    return sc_nodes
+
+# Output Functions
+def print_branch_results(branch_results):
+    print("\nBranch Results:")
+    for branch in branch_results[:50]:  # Limited to first 50 results
+        print(f"Terminal 1 ID: {branch.terminal1_id}, ithmax: {branch.ithmax}, ia: {branch.ia}, i_1a: {branch.i_1a}")
+
+def print_node_results(node_results):
+    print("\nNode Results:")
+    for node in node_results:  # No limit applied here
+        print(f"Node ID: {node.node_id}, ithmax: {node.ithmax}, ia: {node.ia}")
+
+# Entry Point
+if __name__ == "__main__":
+    main_power_fuse_analysis()
