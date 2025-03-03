@@ -1,1 +1,1 @@
-# Single-Phase-Short-Circuit-Current-Analysis- Masters Thesis with DSO in Germany 
+# Power fuses dimensioning in low voltage networks - Masters Thesis 
