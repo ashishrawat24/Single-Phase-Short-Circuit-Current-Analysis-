@@ -1,1 +1,1 @@
-# Power fuses dimensioning in low voltage networks - Masters Thesis 
+#  Masters Thesis : Power fuses dimensioning in low voltage networks
